@@ -142,7 +142,11 @@ async fn route(mut request: Request<IncomingBody>) -> Result<AppResponse, ApiErr
 }
 
 fn path_matches_prefix(path: &str, prefix: &str) -> bool {
-    path == prefix || path == format!("{prefix}/") || path.starts_with(&(prefix.to_string() + "/"))
+    match path.strip_prefix(prefix) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/'),
+        None => false,
+    }
 }
 
 fn serve_asset_route(path: &str) -> Result<AppResponse, ApiError> {

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 percent-encoding = "2.3.1"
 rust-embed = "8.7.2"
 serde = { version = "1", features = ["derive"] }
