@@ -44,9 +44,30 @@ export async function fetch(url: string, signal?: AbortSignal) {
 
       return item;
     });
+
+    applyLiteDotfileFilter(data);
   }
 
   return data;
+}
+
+function applyLiteDotfileFilter(data: Resource) {
+  if (!liteMode || !data.isDir || !useAuthStore().user?.hideDotfiles) {
+    return;
+  }
+
+  data.items = data.items.filter((item) => !item.name.startsWith("."));
+  data.numDirs = 0;
+  data.numFiles = 0;
+
+  data.items.forEach((item, index) => {
+    item.index = index;
+    if (item.isDir) {
+      data.numDirs++;
+    } else {
+      data.numFiles++;
+    }
+  });
 }
 
 async function resourceAction(url: string, method: ApiMethod, content?: any) {
