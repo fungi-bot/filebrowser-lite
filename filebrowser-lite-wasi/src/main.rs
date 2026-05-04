@@ -2,20 +2,22 @@ use percent_encoding::percent_decode_str;
 use rust_embed::Embed;
 use serde::Serialize;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use wstd::http::body::BoundedBody;
 use wstd::http::body::IncomingBody;
+use wstd::http::response::Builder;
 use wstd::http::server::{Finished, Responder};
-use wstd::http::{IntoBody, Method, Request, Response, StatusCode};
-use wstd::io::{copy, Cursor};
+use wstd::http::{HeaderMap, IntoBody, Method, Request, Response, StatusCode};
+use wstd::io::{Cursor as WasiCursor, copy};
 
 const STORAGE_ROOT: &str = "data";
 const RESOURCES_PREFIX: &str = "/api/resources";
 const RAW_PREFIX: &str = "/api/raw";
+const PREVIEW_PREFIX: &str = "/api/preview";
 
 type AppBody = BoundedBody<Vec<u8>>;
 type AppResponse = Response<AppBody>;
@@ -82,6 +84,24 @@ struct ApiError {
     message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewSize {
+    Thumb,
+    Big,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ByteRange {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeError {
+    Invalid,
+    Unsatisfiable,
+}
+
 impl ApiError {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
@@ -114,15 +134,18 @@ async fn route(mut request: Request<IncomingBody>) -> Result<AppResponse, ApiErr
                 message: "filebrowser-lite-wasi is running",
             },
         )),
-        _ if path == RESOURCES_PREFIX
-            || path == format!("{RESOURCES_PREFIX}/")
-            || path.starts_with(&(RESOURCES_PREFIX.to_string() + "/")) => {
-            handle_resources(&mut request).await
-        }
-        _ if path == RAW_PREFIX
-            || path == format!("{RAW_PREFIX}/")
-            || path.starts_with(&(RAW_PREFIX.to_string() + "/")) => handle_raw(&request).await,
+        _ if path_matches_prefix(&path, RESOURCES_PREFIX) => handle_resources(&mut request).await,
+        _ if path_matches_prefix(&path, RAW_PREFIX) => handle_raw(&request).await,
+        _ if path_matches_prefix(&path, PREVIEW_PREFIX) => handle_preview(&request).await,
         _ => serve_asset_route(&path),
+    }
+}
+
+fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    match path.strip_prefix(prefix) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/'),
+        None => false,
     }
 }
 
@@ -147,9 +170,7 @@ fn serve_asset_route(path: &str) -> Result<AppResponse, ApiError> {
     Err(ApiError::new(StatusCode::NOT_FOUND, "route not found"))
 }
 
-async fn handle_resources(
-    request: &mut Request<IncomingBody>,
-) -> Result<AppResponse, ApiError> {
+async fn handle_resources(request: &mut Request<IncomingBody>) -> Result<AppResponse, ApiError> {
     let uri_path = request.uri().path().to_string();
     let resource_path = extract_route_path(&uri_path, RESOURCES_PREFIX);
     let path_info = resolve_storage_path(&resource_path)?;
@@ -184,7 +205,10 @@ async fn handle_resources(
         }
         Method::PUT => {
             if !path_info.host_path.exists() {
-                return Err(ApiError::new(StatusCode::NOT_FOUND, "target file does not exist"));
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "target file does not exist",
+                ));
             }
 
             if path_info.host_path.is_dir() {
@@ -223,10 +247,7 @@ async fn handle_resources(
     }
 }
 
-async fn handle_patch(
-    query: &str,
-    source: &ResolvedPath,
-) -> Result<AppResponse, ApiError> {
+async fn handle_patch(query: &str, source: &ResolvedPath) -> Result<AppResponse, ApiError> {
     if source.guest_path == "/" {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -236,9 +257,8 @@ async fn handle_patch(
 
     let action = query_value(query, "action")
         .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "missing action query param"))?;
-    let destination_raw = query_value(query, "destination").ok_or_else(|| {
-        ApiError::new(StatusCode::BAD_REQUEST, "missing destination query param")
-    })?;
+    let destination_raw = query_value(query, "destination")
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "missing destination query param"))?;
     let destination = resolve_storage_path(&destination_raw)?;
     let override_existing = query_flag(query, "override");
 
@@ -279,10 +299,70 @@ async fn handle_raw(request: &Request<IncomingBody>) -> Result<AppResponse, ApiE
     let uri_path = request.uri().path().to_string();
     let resource_path = extract_route_path(&uri_path, RAW_PREFIX);
     let path_info = resolve_storage_path(&resource_path)?;
-    let metadata = fs::metadata(&path_info.host_path).map_err(|err| match err.kind() {
-        std::io::ErrorKind::NotFound => ApiError::new(StatusCode::NOT_FOUND, "file not found"),
-        _ => io_error(StatusCode::INTERNAL_SERVER_ERROR, err),
-    })?;
+    raw_file_response(request, &path_info)
+}
+
+async fn handle_preview(request: &Request<IncomingBody>) -> Result<AppResponse, ApiError> {
+    if request.method() != Method::GET {
+        return Err(ApiError::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+        ));
+    }
+
+    let uri_path = request.uri().path().to_string();
+    let preview_path = extract_route_path(&uri_path, PREVIEW_PREFIX);
+    let (preview_size, resource_path) = parse_preview_path(&preview_path)?;
+    let path_info = resolve_storage_path(&resource_path)?;
+    let metadata = file_metadata(&path_info.host_path)?;
+
+    if metadata.is_dir() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "preview only supports files",
+        ));
+    }
+
+    if should_preview_raw(&path_info.host_path) {
+        return raw_file_response(request, &path_info);
+    }
+
+    let filename = file_name_from_guest_path(&path_info.guest_path);
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let modified_header = format_http_date(modified);
+    let etag = preview_etag(&path_info.guest_path, modified, preview_size);
+
+    if preview_not_modified(request, &etag, &modified_header) {
+        return build_response(
+            Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header("Cache-Control", "private")
+                .header("Last-Modified", modified_header)
+                .header("ETag", etag),
+            Vec::new(),
+        );
+    }
+
+    match create_image_preview(&path_info.host_path, preview_size) {
+        Ok(bytes) => build_response(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "image/jpeg")
+                .header("Content-Disposition", content_disposition(&filename, true))
+                .header("Cache-Control", "private")
+                .header("Last-Modified", modified_header)
+                .header("ETag", etag),
+            bytes,
+        ),
+        Err(_) => raw_file_response(request, &path_info),
+    }
+}
+
+fn raw_file_response(
+    request: &Request<IncomingBody>,
+    path_info: &ResolvedPath,
+) -> Result<AppResponse, ApiError> {
+    let metadata = file_metadata(&path_info.host_path)?;
 
     if metadata.is_dir() {
         return Err(ApiError::new(
@@ -291,24 +371,71 @@ async fn handle_raw(request: &Request<IncomingBody>) -> Result<AppResponse, ApiE
         ));
     }
 
-    let bytes = fs::read(&path_info.host_path)
-        .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     let filename = file_name_from_guest_path(&path_info.guest_path);
     let inline = query_flag(request.uri().query().unwrap_or(""), "inline");
-    let content_disposition = if inline {
-        format!("inline; filename=\"{}\"", filename)
-    } else {
-        format!("attachment; filename=\"{}\"", filename)
-    };
+    let content_disposition = content_disposition(&filename, inline);
+    let total_len = metadata.len();
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let modified_header = format_http_date(modified);
+    let range_header = request
+        .headers()
+        .get("range")
+        .and_then(|value| value.to_str().ok());
 
-    let response = Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", content_type_for(&path_info.host_path))
-        .header("Content-Disposition", content_disposition)
-        .body(bytes.into_body())
-        .unwrap();
+    match range_header {
+        Some(value) => {
+            let range = match parse_range_header(value, total_len) {
+                Ok(range) => range,
+                Err(RangeError::Invalid) => {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "invalid Range header",
+                    ));
+                }
+                Err(RangeError::Unsatisfiable) => {
+                    return Ok(range_not_satisfiable_response(total_len));
+                }
+            };
+            let bytes = read_file_range(&path_info.host_path, range)?;
+            let content_range = format!("bytes {}-{}/{}", range.start, range.end, total_len);
 
-    Ok(response)
+            build_response(
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header("Content-Type", content_type_for(&path_info.host_path))
+                    .header("Content-Disposition", content_disposition)
+                    .header("Accept-Ranges", "bytes")
+                    .header("Content-Range", content_range)
+                    .header("Content-Length", bytes.len().to_string())
+                    .header("Cache-Control", "private")
+                    .header("Last-Modified", modified_header),
+                bytes,
+            )
+        }
+        None => {
+            let bytes = fs::read(&path_info.host_path)
+                .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+
+            build_response(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", content_type_for(&path_info.host_path))
+                    .header("Content-Disposition", content_disposition)
+                    .header("Accept-Ranges", "bytes")
+                    .header("Content-Length", bytes.len().to_string())
+                    .header("Cache-Control", "private")
+                    .header("Last-Modified", modified_header),
+                bytes,
+            )
+        }
+    }
+}
+
+fn file_metadata(path: &Path) -> Result<fs::Metadata, ApiError> {
+    fs::metadata(path).map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => ApiError::new(StatusCode::NOT_FOUND, "file not found"),
+        _ => io_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    })
 }
 
 fn read_resource(guest_path: &str, host_path: &Path) -> Result<Resource, ApiError> {
@@ -435,16 +562,17 @@ async fn write_request_body(
     host_path: &Path,
 ) -> Result<(), ApiError> {
     if let Some(parent) = host_path.parent() {
-        fs::create_dir_all(parent).map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+        fs::create_dir_all(parent)
+            .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     }
 
     let mut body = Vec::new();
-    copy(request.body_mut(), &mut Cursor::new(&mut body))
+    copy(request.body_mut(), &mut WasiCursor::new(&mut body))
         .await
         .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
 
-    let mut file = File::create(host_path)
-        .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let mut file =
+        File::create(host_path).map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     file.write_all(&body)
         .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     file.sync_all()
@@ -454,7 +582,8 @@ async fn write_request_body(
 
 fn rename_path(source: &Path, destination: &Path) -> Result<(), ApiError> {
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+        fs::create_dir_all(parent)
+            .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     }
 
     if fs::rename(source, destination).is_ok() {
@@ -473,7 +602,8 @@ fn copy_path(source: &Path, destination: &Path) -> Result<(), ApiError> {
     })?;
 
     if metadata.is_dir() {
-        fs::create_dir_all(destination).map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+        fs::create_dir_all(destination)
+            .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
         let entries =
             fs::read_dir(source).map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
         for entry in entries {
@@ -484,10 +614,12 @@ fn copy_path(source: &Path, destination: &Path) -> Result<(), ApiError> {
     }
 
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+        fs::create_dir_all(parent)
+            .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     }
 
-    fs::copy(source, destination).map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    fs::copy(source, destination)
+        .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     Ok(())
 }
 
@@ -498,12 +630,250 @@ fn delete_path(target: &Path) -> Result<(), ApiError> {
     })?;
 
     if metadata.is_dir() {
-        fs::remove_dir_all(target).map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+        fs::remove_dir_all(target)
+            .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     } else {
         fs::remove_file(target).map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     }
 
     Ok(())
+}
+
+fn parse_range_header(value: &str, total_len: u64) -> Result<ByteRange, RangeError> {
+    if total_len == 0 {
+        return Err(RangeError::Unsatisfiable);
+    }
+
+    let range = value
+        .trim()
+        .strip_prefix("bytes=")
+        .ok_or(RangeError::Invalid)?;
+
+    if range.contains(',') {
+        return Err(RangeError::Invalid);
+    }
+
+    let (start_raw, end_raw) = range.split_once('-').ok_or(RangeError::Invalid)?;
+    if start_raw.is_empty() && end_raw.is_empty() {
+        return Err(RangeError::Invalid);
+    }
+
+    if start_raw.is_empty() {
+        let suffix_len = end_raw.parse::<u64>().map_err(|_| RangeError::Invalid)?;
+        if suffix_len == 0 {
+            return Err(RangeError::Unsatisfiable);
+        }
+
+        let start = total_len.saturating_sub(suffix_len);
+        return Ok(ByteRange {
+            start,
+            end: total_len - 1,
+        });
+    }
+
+    let start = start_raw.parse::<u64>().map_err(|_| RangeError::Invalid)?;
+    if start >= total_len {
+        return Err(RangeError::Unsatisfiable);
+    }
+
+    let end = if end_raw.is_empty() {
+        total_len - 1
+    } else {
+        let requested_end = end_raw.parse::<u64>().map_err(|_| RangeError::Invalid)?;
+        if requested_end < start {
+            return Err(RangeError::Invalid);
+        }
+        requested_end.min(total_len - 1)
+    };
+
+    Ok(ByteRange { start, end })
+}
+
+fn read_file_range(path: &Path, range: ByteRange) -> Result<Vec<u8>, ApiError> {
+    let mut file =
+        File::open(path).map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    file.seek(SeekFrom::Start(range.start))
+        .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+
+    let length = range.end - range.start + 1;
+    let mut bytes = Vec::with_capacity(length.min(1024 * 1024) as usize);
+    file.take(length)
+        .read_to_end(&mut bytes)
+        .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(bytes)
+}
+
+fn range_not_satisfiable_response(total_len: u64) -> AppResponse {
+    Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header("Content-Range", format!("bytes */{}", total_len))
+        .header("Accept-Ranges", "bytes")
+        .body(Vec::new().into_body())
+        .unwrap()
+}
+
+fn parse_preview_path(path: &str) -> Result<(PreviewSize, String), ApiError> {
+    let trimmed = path.trim_start_matches('/');
+    let (size_raw, resource_raw) = trimmed
+        .split_once('/')
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "missing preview path"))?;
+
+    let size = match size_raw {
+        "thumb" => PreviewSize::Thumb,
+        "big" => PreviewSize::Big,
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "unsupported preview size",
+            ));
+        }
+    };
+
+    Ok((size, format!("/{resource_raw}")))
+}
+
+fn should_preview_raw(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "gif" | "svg"
+    )
+}
+
+fn create_image_preview(path: &Path, preview_size: PreviewSize) -> Result<Vec<u8>, String> {
+    let bytes = fs::read(path).map_err(|err| err.to_string())?;
+    let image = image::load_from_memory(&bytes).map_err(|err| err.to_string())?;
+    let filter = image::imageops::FilterType::Triangle;
+    let preview = match preview_size {
+        PreviewSize::Thumb => image.resize_to_fill(256, 256, filter),
+        PreviewSize::Big => image.resize(1080, 1080, filter),
+    };
+
+    let mut output = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, 82);
+    encoder
+        .encode_image(&preview)
+        .map_err(|err| err.to_string())?;
+    Ok(output)
+}
+
+fn preview_etag(path: &str, modified: SystemTime, preview_size: PreviewSize) -> String {
+    let modified = modified
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let size = match preview_size {
+        PreviewSize::Thumb => "thumb",
+        PreviewSize::Big => "big",
+    };
+    format!("\"{}:{modified}:{size}\"", rfc5987_encode(path))
+}
+
+fn preview_not_modified(request: &Request<IncomingBody>, etag: &str, last_modified: &str) -> bool {
+    headers_match_preview_cache(request.headers(), etag, last_modified)
+}
+
+fn headers_match_preview_cache(headers: &HeaderMap, etag: &str, last_modified: &str) -> bool {
+    if headers
+        .get("if-none-match")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|candidate| candidate == etag || candidate == "*")
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    headers
+        .get("if-modified-since")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim() == last_modified)
+        .unwrap_or(false)
+}
+
+fn content_disposition(filename: &str, inline: bool) -> String {
+    let disposition_type = if inline { "inline" } else { "attachment" };
+    format!(
+        "{}; filename=\"{}\"; filename*=UTF-8''{}",
+        disposition_type,
+        ascii_filename_fallback(filename),
+        rfc5987_encode(filename)
+    )
+}
+
+fn ascii_filename_fallback(filename: &str) -> String {
+    let fallback: String = filename
+        .chars()
+        .map(|ch| match ch {
+            '\x20'..='\x7e' if ch != '"' && ch != '\\' && ch != ';' => ch,
+            _ => '_',
+        })
+        .collect();
+
+    if fallback.is_empty() {
+        "download".to_string()
+    } else {
+        fallback
+    }
+}
+
+fn rfc5987_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.as_bytes() {
+        match *byte {
+            b'0'..=b'9'
+            | b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'&'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~' => encoded.push(*byte as char),
+            _ => encoded.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    encoded
+}
+
+fn format_http_date(value: SystemTime) -> String {
+    let value = OffsetDateTime::from(value).to_offset(time::UtcOffset::UTC);
+    const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    let weekday = WEEKDAYS[value.weekday().number_days_from_monday() as usize];
+    let month = MONTHS[value.month() as u8 as usize - 1];
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        weekday,
+        value.day(),
+        month,
+        value.year(),
+        value.hour(),
+        value.minute(),
+        value.second()
+    )
+}
+
+fn build_response(builder: Builder, body: Vec<u8>) -> Result<AppResponse, ApiError> {
+    builder
+        .body(body.into_body())
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
 }
 
 fn extract_route_path(path: &str, prefix: &str) -> String {
@@ -597,9 +967,9 @@ fn detect_file_type(name: &str) -> String {
         "mp3" | "wav" | "flac" | "ogg" | "m4a" => "audio".to_string(),
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" => "image".to_string(),
         "pdf" => "pdf".to_string(),
-        "md" | "txt" | "json" | "toml" | "yaml" | "yml" | "rs" | "go" | "js"
-        | "ts" | "tsx" | "jsx" | "html" | "css" | "csv" | "xml" | "sh" | "py"
-        | "java" | "c" | "cc" | "cpp" | "h" | "hpp" => "text".to_string(),
+        "md" | "txt" | "json" | "toml" | "yaml" | "yml" | "rs" | "go" | "js" | "ts" | "tsx"
+        | "jsx" | "html" | "css" | "csv" | "xml" | "sh" | "py" | "java" | "c" | "cc" | "cpp"
+        | "h" | "hpp" => "text".to_string(),
         _ => "blob".to_string(),
     }
 }
@@ -637,7 +1007,17 @@ fn content_type_for(path: &Path) -> &'static str {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
+        "webp" => "image/webp",
         "svg" => "image/svg+xml",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "ogg" => "audio/ogg",
+        "m4a" => "audio/mp4",
         "pdf" => "application/pdf",
         "zip" => "application/zip",
         _ => "application/octet-stream",
@@ -651,7 +1031,10 @@ fn query_value(query: &str, key: &str) -> Option<String> {
             return None;
         }
 
-        percent_decode_str(current_value).decode_utf8().ok().map(|value| value.to_string())
+        percent_decode_str(current_value)
+            .decode_utf8()
+            .ok()
+            .map(|value| value.to_string())
     })
 }
 
@@ -679,7 +1062,7 @@ fn normalize_asset_path(path: &str) -> String {
 }
 
 fn config_js_response() -> AppResponse {
-        let body = r#"window.__FILEBROWSER_CONFIG__ = {
+    let body = r#"window.__FILEBROWSER_CONFIG__ = {
     AuthMethod: "json",
     BaseURL: "",
     CSS: false,
@@ -687,13 +1070,13 @@ fn config_js_response() -> AppResponse {
     DisableExternal: false,
     DisableUsedPercentage: true,
     EnableExec: false,
-    EnableThumbs: false,
+    EnableThumbs: true,
     LogoutPage: "",
     LoginPage: false,
     Name: "File Browser Lite",
     NoAuth: true,
     ReCaptcha: false,
-    ResizePreview: false,
+    ResizePreview: true,
     Signup: false,
     StaticURL: "",
     Theme: "",
@@ -702,11 +1085,11 @@ fn config_js_response() -> AppResponse {
     LiteMode: true,
 };"#;
 
-        Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/javascript; charset=utf-8")
-                .body(body.as_bytes().to_vec().into_body())
-                .unwrap()
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/javascript; charset=utf-8")
+        .body(body.as_bytes().to_vec().into_body())
+        .unwrap()
 }
 
 fn asset_response(path: &str, bytes: &[u8]) -> AppResponse {
@@ -754,4 +1137,147 @@ fn json_error(err: ApiError) -> AppResponse {
         "error": err.message,
     });
     json_response(err.status, &payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_closed_range() {
+        assert_eq!(
+            parse_range_header("bytes=10-19", 100),
+            Ok(ByteRange { start: 10, end: 19 })
+        );
+    }
+
+    #[test]
+    fn parses_open_ended_range() {
+        assert_eq!(
+            parse_range_header("bytes=90-", 100),
+            Ok(ByteRange { start: 90, end: 99 })
+        );
+    }
+
+    #[test]
+    fn parses_suffix_range() {
+        assert_eq!(
+            parse_range_header("bytes=-25", 100),
+            Ok(ByteRange { start: 75, end: 99 })
+        );
+    }
+
+    #[test]
+    fn clamps_range_end_to_file_length() {
+        assert_eq!(
+            parse_range_header("bytes=90-200", 100),
+            Ok(ByteRange { start: 90, end: 99 })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_ranges() {
+        assert_eq!(
+            parse_range_header("items=0-10", 100),
+            Err(RangeError::Invalid)
+        );
+        assert_eq!(
+            parse_range_header("bytes=10-5", 100),
+            Err(RangeError::Invalid)
+        );
+        assert_eq!(
+            parse_range_header("bytes=0-1,4-5", 100),
+            Err(RangeError::Invalid)
+        );
+        assert_eq!(parse_range_header("bytes=-", 100), Err(RangeError::Invalid));
+    }
+
+    #[test]
+    fn rejects_unsatisfiable_ranges() {
+        assert_eq!(
+            parse_range_header("bytes=100-101", 100),
+            Err(RangeError::Unsatisfiable)
+        );
+        assert_eq!(
+            parse_range_header("bytes=-0", 100),
+            Err(RangeError::Unsatisfiable)
+        );
+        assert_eq!(
+            parse_range_header("bytes=0-0", 0),
+            Err(RangeError::Unsatisfiable)
+        );
+    }
+
+    #[test]
+    fn builds_range_not_satisfiable_response() {
+        let response = range_not_satisfiable_response(123);
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("Content-Range")
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes */123")
+        );
+    }
+
+    #[test]
+    fn parses_preview_paths() {
+        let (size, path) = parse_preview_path("/thumb/photos/a.jpg").unwrap();
+        assert_eq!(size, PreviewSize::Thumb);
+        assert_eq!(path, "/photos/a.jpg");
+
+        let (size, path) = parse_preview_path("/big/photos/a.jpg").unwrap();
+        assert_eq!(size, PreviewSize::Big);
+        assert_eq!(path, "/photos/a.jpg");
+
+        assert!(parse_preview_path("/tiny/photos/a.jpg").is_err());
+        assert!(parse_preview_path("/thumb").is_err());
+    }
+
+    #[test]
+    fn formats_http_date_for_last_modified() {
+        assert_eq!(
+            format_http_date(SystemTime::UNIX_EPOCH),
+            "Thu, 01 Jan 1970 00:00:00 GMT"
+        );
+    }
+
+    #[test]
+    fn content_disposition_uses_safe_fallback_and_rfc5987_filename() {
+        assert_eq!(
+            content_disposition("a\";中.jpg", true),
+            "inline; filename=\"a___.jpg\"; filename*=UTF-8''a%22%3B%E4%B8%AD.jpg"
+        );
+    }
+
+    #[test]
+    fn preview_etag_is_ascii_safe() {
+        assert_eq!(
+            preview_etag("/图/a.jpg", SystemTime::UNIX_EPOCH, PreviewSize::Thumb),
+            "\"%2F%E5%9B%BE%2Fa.jpg:0:thumb\""
+        );
+    }
+
+    #[test]
+    fn matches_preview_cache_conditions() {
+        let mut headers = HeaderMap::new();
+        headers.insert("if-none-match", "\"abc\"".parse().unwrap());
+        assert!(headers_match_preview_cache(
+            &headers,
+            "\"abc\"",
+            "Thu, 01 Jan 1970 00:00:00 GMT"
+        ));
+
+        headers.clear();
+        headers.insert(
+            "if-modified-since",
+            "Thu, 01 Jan 1970 00:00:00 GMT".parse().unwrap(),
+        );
+        assert!(headers_match_preview_cache(
+            &headers,
+            "\"abc\"",
+            "Thu, 01 Jan 1970 00:00:00 GMT"
+        ));
+    }
 }
