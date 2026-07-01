@@ -1,32 +1,70 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/filebrowser/filebrowser/master/branding/banner.png" width="550"/>
+  <img src="branding/banner.png" width="550" alt="File Browser Lite"/>
 </p>
 
-[![Build](https://github.com/filebrowser/filebrowser/actions/workflows/ci.yaml/badge.svg)](https://github.com/filebrowser/filebrowser/actions/workflows/ci.yaml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/filebrowser/filebrowser/v2)](https://goreportcard.com/report/github.com/filebrowser/filebrowser/v2)
-[![Version](https://img.shields.io/github/release/filebrowser/filebrowser.svg)](https://github.com/filebrowser/filebrowser/releases/latest)
+# File Browser Lite
 
-Experimental minimal WASI backend work lives in `filebrowser-lite-wasi/`; see [filebrowser-lite-wasi/README.md](filebrowser-lite-wasi/README.md) for build, run, and release details.
+File Browser Lite is a WASI Preview 2 fork of
+[File Browser](https://github.com/filebrowser/filebrowser).
 
-File Browser provides a file managing interface within a specified directory and it can be used to upload, delete, preview and edit your files. It is a **create-your-own-cloud**-kind of software where you can just install it on your server, direct it to a path and access your files through a nice web interface.
+It combines a minimal Rust/WASI backend with an adapted File Browser frontend
+and packages them into a single `.wasm` component.
 
-## Documentation
+## Status
 
-Documentation on how to install, configure, and contribute to this project is hosted at [filebrowser.org](https://filebrowser.org).
+File Browser Lite is experimental and currently intended for local,
+trusted-network, and embedded use.
 
-## Project Status
+Authentication is not currently included. Do not expose it directly to an
+untrusted network.
 
-This project is a finished product which fulfills its goal: be a single binary web File Browser which can be run by anyone anywhere. That means that File Browser is currently on **maintenance-only** mode. Therefore, please note the following:
+## Quick Start
 
-- It can take a while until someone gets back to you. Please be patient.
-- [Issues](https://github.com/filebrowser/filebrowser/issues) are meant to track bugs. Unrelated issues will be converted into [discussions](https://github.com/filebrowser/filebrowser/discussions).
-- No new features will be implemented by maintainers. Pull requests for new features will be reviewed on a case by case basis.
-- The priority is triaging issues, addressing security issues and reviewing pull requests meant to solve bugs.
+Requires a recent version of [Wasmtime](https://wasmtime.dev/) with
+`wasmtime serve` support.
 
-## Contributing
+Download the latest release:
 
-Contributions are always welcome. To start contributing to this project, read our [guidelines](CONTRIBUTING.md) first.
+```bash
+curl -L \
+  https://github.com/enbop/filebrowser-lite/releases/latest/download/filebrowser-lite-wasi.wasm \
+  -o filebrowser-lite-wasi.wasm
+```
+
+Create a directory and serve it:
+
+```bash
+mkdir -p data
+
+wasmtime serve \
+  --addr=127.0.0.1:8082 \
+  -Scli \
+  --dir data \
+  ./filebrowser-lite-wasi.wasm
+```
+
+Open <http://localhost:8082/>.
+
+Only the directory mounted with `--dir` is exposed to the WASI component.
+
+## Supported Features
+
+- Directory listing
+- File metadata
+- File download and upload
+- Create directories
+- Rename and copy files
+- Delete files and directories
+- Overwrite existing file content
+
+The current WASI build does not include authentication, users, shares, search,
+previews, or TUS uploads.
+
+## Development
+
+See [`filebrowser-lite-wasi/README.md`](filebrowser-lite-wasi/README.md) for
+source builds and implementation notes.
 
 ## License
 
-[Apache License 2.0](LICENSE) © File Browser Contributors
+Licensed under the [Apache License 2.0](LICENSE).

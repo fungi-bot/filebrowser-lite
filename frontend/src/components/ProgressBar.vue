@@ -66,11 +66,11 @@ export default {
     },
     "bg-color": {
       type: String,
-      default: "#eee",
+      default: "var(--surfaceSecondary)",
     },
     "bar-color": {
       type: String,
-      default: "#2196f3", // match .blue color to Material Design's 'Blue 500' color
+      default: "var(--blue)",
     },
     "bar-transition": {
       type: String,
@@ -102,7 +102,7 @@ export default {
     },
     "text-fg-color": {
       type: String,
-      default: "#222",
+      default: "var(--textSecondary)",
     },
   },
   computed: {

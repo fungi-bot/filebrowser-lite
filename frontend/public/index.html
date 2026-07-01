@@ -18,11 +18,6 @@
 
     <meta name="robots" content="noindex,nofollow" />
 
-    <link
-      rel="icon"
-      type="image/svg+xml"
-      href="[{[ .StaticURL ]}]/img/icons/favicon.svg"
-    />
     <link rel="shortcut icon" href="[{[ .StaticURL ]}]/img/icons/favicon.ico" />
     <link
       rel="apple-touch-icon"
@@ -39,7 +34,7 @@
     />
     <meta
       name="theme-color"
-      content="[{[ if .Color -]}][{[ .Color ]}][{[ else ]}]#2979ff[{[ end ]}]"
+      content="[{[ if .Color -]}][{[ .Color ]}][{[ else ]}]#d65d1c[{[ end ]}]"
     />
 
     <!-- Inject Some Variables and generate the manifest json -->
@@ -67,8 +62,8 @@
         ],
         start_url: window.location.origin + window.FileBrowser.BaseURL,
         display: "standalone",
-        background_color: "#ffffff",
-        theme_color: window.FileBrowser.Color || "#455a64",
+        background_color: "#faf8f6",
+        theme_color: window.FileBrowser.Color || "#d65d1c",
       };
 
       const stringManifest = JSON.stringify(dynamicManifest);

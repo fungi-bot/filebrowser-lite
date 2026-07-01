@@ -300,7 +300,7 @@ body.rtl .card .card-action {
   width: 150%;
   font-size: 0.6em;
   text-align: center;
-  background: #44a6f5;
+  background: var(--blue);
   color: #fff;
   padding: 0.5em 0.2em;
   border-radius: 0.4em;

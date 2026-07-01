@@ -143,7 +143,7 @@ html[dir="rtl"] .breadcrumbs a {
 
 .progress div {
   height: 100%;
-  background-color: #40c4ff;
+  background-color: var(--blue);
   width: 0;
   transition: 0.2s ease width;
 }
@@ -187,6 +187,6 @@ body > div[style*="z-index: 9990"] {
 }
 
 #modal-background .button:focus {
-  outline: 1px solid #2195f32d;
+  outline: 1px solid var(--focus-ring);
   outline-offset: 1px;
 }

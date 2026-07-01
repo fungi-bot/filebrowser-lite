@@ -29,7 +29,7 @@
 
 .share__box__icon i {
   font-size: 10em;
-  color: #40c4ff;
+  color: var(--blue);
 }
 
 .share__box__center {
