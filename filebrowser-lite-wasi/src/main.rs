@@ -1,26 +1,32 @@
+use bytes::Bytes;
+use http::response::Builder;
+use http::{HeaderMap, Method, Request, Response, StatusCode};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
 use percent_encoding::percent_decode_str;
 use rust_embed::Embed;
 use serde::Serialize;
+use std::convert::Infallible;
+use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use wstd::http::body::BoundedBody;
-use wstd::http::body::IncomingBody;
-use wstd::http::response::Builder;
-use wstd::http::server::{Finished, Responder};
-use wstd::http::{HeaderMap, IntoBody, Method, Request, Response, StatusCode};
-use wstd::io::{Cursor as WasiCursor, copy};
+use tokio::net::TcpListener;
 
 const STORAGE_ROOT: &str = "data";
 const RESOURCES_PREFIX: &str = "/api/resources";
 const RAW_PREFIX: &str = "/api/raw";
 const PREVIEW_PREFIX: &str = "/api/preview";
 
-type AppBody = BoundedBody<Vec<u8>>;
-type AppResponse = Response<AppBody>;
+type AppRequest = Request<Vec<u8>>;
+type AppResponse = Response<Vec<u8>>;
 
 #[derive(Embed)]
 #[folder = "../frontend/dist"]
@@ -111,17 +117,57 @@ impl ApiError {
     }
 }
 
-#[wstd::http_server]
-async fn main(request: Request<IncomingBody>, responder: Responder) -> Finished {
-    let result = route(request).await;
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let address = parse_listen_address()?;
+    let listener = TcpListener::bind(address).await?;
+    eprintln!("filebrowser-lite-wasi listening on {address}");
 
-    match result {
-        Ok(response) => responder.respond(response).await,
-        Err(err) => responder.respond(json_error(err)).await,
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        tokio::spawn(async move {
+            let connection = http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service_fn(handle_hyper_request));
+            if let Err(error) = connection.await {
+                eprintln!("connection from {peer} failed: {error}");
+            }
+        });
     }
 }
 
-async fn route(mut request: Request<IncomingBody>) -> Result<AppResponse, ApiError> {
+fn parse_listen_address() -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let mut args = env::args().skip(1);
+    let mut address = "127.0.0.1:8082".parse()?;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--listen" => {
+                address = args
+                    .next()
+                    .ok_or("missing socket address after --listen")?
+                    .parse()?;
+            }
+            other => return Err(format!("unknown argument: {other}").into()),
+        }
+    }
+    Ok(address)
+}
+
+async fn handle_hyper_request(
+    request: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let (parts, body) = request.into_parts();
+    let response = match body.collect().await {
+        Ok(body) => match route(Request::from_parts(parts, body.to_bytes().to_vec())).await {
+            Ok(response) => response,
+            Err(error) => json_error(error),
+        },
+        Err(error) => json_error(ApiError::new(StatusCode::BAD_REQUEST, error.to_string())),
+    };
+    let (parts, body) = response.into_parts();
+    Ok(Response::from_parts(parts, Full::new(Bytes::from(body))))
+}
+
+async fn route(mut request: AppRequest) -> Result<AppResponse, ApiError> {
     let path = request.uri().path().to_string();
     let method = request.method().clone();
 
@@ -170,7 +216,7 @@ fn serve_asset_route(path: &str) -> Result<AppResponse, ApiError> {
     Err(ApiError::new(StatusCode::NOT_FOUND, "route not found"))
 }
 
-async fn handle_resources(request: &mut Request<IncomingBody>) -> Result<AppResponse, ApiError> {
+async fn handle_resources(request: &mut AppRequest) -> Result<AppResponse, ApiError> {
     let uri_path = request.uri().path().to_string();
     let resource_path = extract_route_path(&uri_path, RESOURCES_PREFIX);
     let path_info = resolve_storage_path(&resource_path)?;
@@ -288,7 +334,7 @@ async fn handle_patch(query: &str, source: &ResolvedPath) -> Result<AppResponse,
     Ok(json_response(StatusCode::OK, &resource))
 }
 
-async fn handle_raw(request: &Request<IncomingBody>) -> Result<AppResponse, ApiError> {
+async fn handle_raw(request: &AppRequest) -> Result<AppResponse, ApiError> {
     if request.method() != Method::GET {
         return Err(ApiError::new(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -302,7 +348,7 @@ async fn handle_raw(request: &Request<IncomingBody>) -> Result<AppResponse, ApiE
     raw_file_response(request, &path_info)
 }
 
-async fn handle_preview(request: &Request<IncomingBody>) -> Result<AppResponse, ApiError> {
+async fn handle_preview(request: &AppRequest) -> Result<AppResponse, ApiError> {
     if request.method() != Method::GET {
         return Err(ApiError::new(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -359,7 +405,7 @@ async fn handle_preview(request: &Request<IncomingBody>) -> Result<AppResponse, 
 }
 
 fn raw_file_response(
-    request: &Request<IncomingBody>,
+    request: &AppRequest,
     path_info: &ResolvedPath,
 ) -> Result<AppResponse, ApiError> {
     let metadata = file_metadata(&path_info.host_path)?;
@@ -557,19 +603,13 @@ fn read_resource_item(guest_path: &str, host_path: &Path) -> Result<ResourceItem
     })
 }
 
-async fn write_request_body(
-    request: &mut Request<IncomingBody>,
-    host_path: &Path,
-) -> Result<(), ApiError> {
+async fn write_request_body(request: &mut AppRequest, host_path: &Path) -> Result<(), ApiError> {
     if let Some(parent) = host_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     }
 
-    let mut body = Vec::new();
-    copy(request.body_mut(), &mut WasiCursor::new(&mut body))
-        .await
-        .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    let body = std::mem::take(request.body_mut());
 
     let mut file =
         File::create(host_path).map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
@@ -708,7 +748,7 @@ fn range_not_satisfiable_response(total_len: u64) -> AppResponse {
         .status(StatusCode::RANGE_NOT_SATISFIABLE)
         .header("Content-Range", format!("bytes */{}", total_len))
         .header("Accept-Ranges", "bytes")
-        .body(Vec::new().into_body())
+        .body(Vec::new())
         .unwrap()
 }
 
@@ -772,7 +812,7 @@ fn preview_etag(path: &str, modified: SystemTime, preview_size: PreviewSize) -> 
     format!("\"{}:{modified}:{size}\"", rfc5987_encode(path))
 }
 
-fn preview_not_modified(request: &Request<IncomingBody>, etag: &str, last_modified: &str) -> bool {
+fn preview_not_modified(request: &AppRequest, etag: &str, last_modified: &str) -> bool {
     headers_match_preview_cache(request.headers(), etag, last_modified)
 }
 
@@ -872,7 +912,7 @@ fn format_http_date(value: SystemTime) -> String {
 
 fn build_response(builder: Builder, body: Vec<u8>) -> Result<AppResponse, ApiError> {
     builder
-        .body(body.into_body())
+        .body(body)
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
 }
 
@@ -1088,7 +1128,7 @@ fn config_js_response() -> AppResponse {
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/javascript; charset=utf-8")
-        .body(body.as_bytes().to_vec().into_body())
+        .body(body.as_bytes().to_vec())
         .unwrap()
 }
 
@@ -1096,7 +1136,7 @@ fn asset_response(path: &str, bytes: &[u8]) -> AppResponse {
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", content_type_for_asset(path))
-        .body(bytes.to_vec().into_body())
+        .body(bytes.to_vec())
         .unwrap()
 }
 
@@ -1127,7 +1167,7 @@ fn json_response<T: Serialize>(status: StatusCode, value: &T) -> AppResponse {
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
-        .body(body.into_body())
+        .body(body.into_bytes())
         .unwrap()
 }
 

@@ -20,8 +20,8 @@ untrusted network.
 
 ## Quick Start
 
-Requires a recent version of [Wasmtime](https://wasmtime.dev/) with
-`wasmtime serve` support.
+Requires a recent version of [Wasmtime](https://wasmtime.dev/) with WASIp2 TCP
+support.
 
 Download the latest release:
 
@@ -36,11 +36,11 @@ Create a directory and serve it:
 ```bash
 mkdir -p data
 
-wasmtime serve \
-  --addr=127.0.0.1:8082 \
-  -Scli \
+wasmtime run \
+  -Scli -Stcp -Sinherit-network \
   --dir data \
-  ./filebrowser-lite-wasi.wasm
+  ./filebrowser-lite-wasi.wasm \
+  --listen 127.0.0.1:8082
 ```
 
 Open <http://localhost:8082/>.
